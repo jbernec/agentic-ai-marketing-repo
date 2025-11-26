@@ -13,15 +13,6 @@ from langgraph.store.base import (
     IndexConfig,
     ensure_embeddings,
     get_text_at_path,
-)
-
-from langgraph.store.base import (
-    BaseStore,
-    Item,
-    SearchItem,
-    IndexConfig,
-    ensure_embeddings,
-    get_text_at_path,
     GetOp,
     ListNamespacesOp,
     Op,
@@ -40,8 +31,8 @@ class CosmosDBStore(BaseStore):
     Intended to be conceptually similar to PostgresStore, but using Cosmos:
 
     - Each item is stored as a JSON document with:
-        id:           str   (same as namespaceKey)
-        namespaceKey: str   (partition key)
+        id:           str   (namespace concatenated with key)
+        namespaceKey: str   (partition key derived from namespace only)
         namespace:    list[str]
         key:          str
         value:        dict
@@ -80,23 +71,21 @@ class CosmosDBStore(BaseStore):
         self.partition_key_path = partition_key_path
 
         # Optional semantic index (dims, embed, fields)
-        self._index_cfg: Optional[IndexConfig] = (
-            ensure_embeddings(index) if index is not None else None
-        )
+        self._index_cfg: Optional[IndexConfig]
 
         # DB/container clients will be bound after setup()
         self._db = self.client.get_database_client(database_id)
         self._container = self._db.get_container_client(container_id)
-        if index is not None:
+        if index is None:
+            self._index_cfg = None
+        else:
             cfg = dict(index)
             embed_cfg = cfg.get("embed")
-        if embed_cfg is None:
-            raise ValueError("index config must include an 'embed' entry")
+            if embed_cfg is None:
+                raise ValueError("index config must include an 'embed' entry")
             cfg["embed"] = ensure_embeddings(embed_cfg)
             cfg.setdefault("fields", None)
             self._index_cfg = cast(IndexConfig, cfg)
-        else:
-            self._index_cfg = None
 
     # ----------------------------------------------------------------------
     # Setup: create DB + container (similar purpose to PostgresStore.setup)
@@ -182,17 +171,25 @@ class CosmosDBStore(BaseStore):
     @staticmethod
     def _ns_to_str(namespace: Namespace) -> str:
         return "|".join(namespace)
-    
+
     @staticmethod
-    def _make_namespace_key(namespace: Namespace, key: str) -> str:
+    def _doc_id(namespace: Namespace, key: str) -> str:
         ns_str = CosmosDBStore._ns_to_str(namespace)
         return f"{ns_str}::{key}" if ns_str else key
 
+    @staticmethod
+    def _partition_key(namespace: Namespace, key: Optional[str] = None) -> str:
+        ns_str = CosmosDBStore._ns_to_str(namespace)
+        if ns_str:
+            return ns_str
+        if key is None:
+            raise ValueError("Key required when namespace is empty")
+        return key
+    
     # @staticmethod
     # def _make_namespace_key(namespace: Namespace, key: str) -> str:
-    #     if namespace:
-    #         return f"{'/'.join(namespace)}::{key}"
-    #     return key
+    #     ns_str = CosmosDBStore._ns_to_str(namespace)
+    #     return f"{ns_str}::{key}" if ns_str else key
 
     @staticmethod
     def _now() -> datetime:
@@ -217,9 +214,10 @@ class CosmosDBStore(BaseStore):
         *,
         refresh_ttl: Optional[bool] = None,  # unused; TTL handled by Cosmos
     ) -> Optional[Item]:
-        ns_key = self._make_namespace_key(namespace, key)
+        doc_id = self._doc_id(namespace, key)
+        partition_key = self._partition_key(namespace, key)
         try:
-            doc = self._container.read_item(item=ns_key, partition_key=ns_key)
+            doc = self._container.read_item(item=doc_id, partition_key=partition_key)
         except exceptions.CosmosResourceNotFoundError:
             return None
         return self._to_item(doc)
@@ -233,20 +231,21 @@ class CosmosDBStore(BaseStore):
         index: Optional[List[str] | bool] = None,
         ttl: Optional[float] = None,  # minutes; we convert to seconds
     ) -> None:
-        ns_key = self._make_namespace_key(namespace, key)
+        doc_id = self._doc_id(namespace, key)
+        partition_key = self._partition_key(namespace, key)
 
         # Deletion semantic: value=None => delete
         if value is None:
             try:
-                self._container.delete_item(item=ns_key, partition_key=ns_key)
+                self._container.delete_item(item=doc_id, partition_key=partition_key)
             except exceptions.CosmosResourceNotFoundError:
                 pass
             return
 
         now = self._now()
         doc: Dict[str, Any] = {
-            "id": ns_key,
-            "namespaceKey": ns_key,
+            "id": doc_id,
+            "namespaceKey": partition_key,
             "namespace": list(namespace),
             "key": key,
             "value": value,
@@ -269,8 +268,17 @@ class CosmosDBStore(BaseStore):
             else:
                 for path in fields:
                     text_at_path = get_text_at_path(value, path)
+                    # Handle both str and list[str] responses from get_text_at_path
                     if isinstance(text_at_path, str):
                         text_chunks.append(text_at_path)
+                    elif isinstance(text_at_path, list):
+                        # If it's a list, join all string elements
+                        for item in text_at_path:
+                            if isinstance(item, str):
+                                text_chunks.append(item)
+                    elif text_at_path is not None:
+                        # Fallback: stringify any other type
+                        text_chunks.append(str(text_at_path))
 
             text_for_embedding = "\n".join(text_chunks) if text_chunks else ""
             if text_for_embedding:
@@ -281,7 +289,12 @@ class CosmosDBStore(BaseStore):
         self._container.upsert_item(doc)
 
     def delete(self, namespace: Namespace, key: str) -> None:
-        self.put(namespace, key, value=None)
+        doc_id = self._doc_id(namespace, key)
+        partition_key = self._partition_key(namespace, key)
+        try:
+            self._container.delete_item(item=doc_id, partition_key=partition_key)
+        except exceptions.CosmosResourceNotFoundError:
+            pass
 
     def search(
         self,
@@ -344,7 +357,7 @@ class CosmosDBStore(BaseStore):
                     SearchItem(
                         namespace=tuple(doc["namespace"]),
                         key=doc["key"],
-                        value=doc["value"],
+                        value=doc["docValue"],
                         created_at=datetime.fromisoformat(doc["created_at"]),
                         updated_at=datetime.fromisoformat(doc["updated_at"]),
                         score=float(doc.get("similarity", 0.0)),
